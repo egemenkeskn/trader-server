@@ -85,6 +85,63 @@ function roundToStep(value, stepSize) {
     return rounded.toFixed(precision);
 }
 
+// Get current market price for a symbol
+async function getMarketPrice(symbol) {
+    try {
+        const response = await fetch(`https://testnet.binancefuture.com/fapi/v1/ticker/price?symbol=${symbol}`);
+        const data = await response.json();
+        return parseFloat(data.price);
+    } catch (error) {
+        console.error(`[Binance API] Failed to fetch market price for ${symbol}:`, error);
+        return 0;
+    }
+}
+
+// Validate trade before execution
+async function validateTrade(cleanSymbol, quantity, side, userBalances) {
+    // 1. Quantity must be greater than zero
+    const qty = parseFloat(quantity);
+    if (qty <= 0) {
+        throw new Error(`Invalid quantity: ${quantity} must be greater than zero`);
+    }
+
+    // 2. Get market price
+    const marketPrice = await getMarketPrice(cleanSymbol);
+    if (marketPrice === 0) {
+        throw new Error(`Could not fetch market price for ${cleanSymbol}`);
+    }
+
+    // 3. Calculate notional value (quantity * price)
+    const notionalValue = qty * marketPrice;
+
+    // Minimum notional values
+    const MIN_NOTIONAL_STANDARD = 20; // Most symbols require at least 20 USDT
+    const MIN_NOTIONAL_SMALL = 5; // BTC, ETH, and other high-value assets
+
+    // High-value symbols that can have smaller notional
+    const highValueSymbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT'];
+    const minNotional = highValueSymbols.includes(cleanSymbol) ? MIN_NOTIONAL_SMALL : MIN_NOTIONAL_STANDARD;
+
+    if (notionalValue < minNotional) {
+        throw new Error(`Notional value ${notionalValue.toFixed(2)} USDT is below minimum ${minNotional} USDT for ${cleanSymbol}`);
+    }
+
+    // 4. Check if user has sufficient balance (USDT)
+    const usdtBalance = userBalances.find(b => b.asset === 'USDT');
+    const availableBalance = usdtBalance ? parseFloat(usdtBalance.free) : 0;
+
+    // Rough margin requirement check (notional / leverage, but we'll use full notional for safety)
+    if (side === 'BUY' || side === 'SELL') {
+        // For opening positions, check if notional is less than or equal to available balance
+        // This is a rough check - actual margin requirement depends on leverage
+        if (notionalValue > availableBalance * 0.9) { // 90% of balance to leave room for fees
+            throw new Error(`Insufficient balance: Need ~${notionalValue.toFixed(2)} USDT but only ${availableBalance.toFixed(2)} USDT available`);
+        }
+    }
+
+    return { notionalValue, marketPrice };
+}
+
 async function getUserBinanceContext(supabaseAdmin, userId) {
     if (!ENCRYPTION_KEY) throw new Error('Server config error: encryption key missing');
 
@@ -103,18 +160,18 @@ async function getUserBinanceContext(supabaseAdmin, userId) {
 
     const timestamp = Date.now();
     const recvWindow = 5000;
-    const queryString = `timestamp=${timestamp}&recvWindow=${recvWindow}`;
+    const queryString = `timestamp = ${timestamp}& recvWindow=${recvWindow} `;
     const signature = signHmac(secretKey, queryString);
 
     const BINANCE_API_URL = 'https://testnet.binancefuture.com/fapi/v2/account';
-    const response = await fetch(`${BINANCE_API_URL}?${queryString}&signature=${signature}`, {
+    const response = await fetch(`${BINANCE_API_URL}?${queryString}& signature=${signature} `, {
         method: 'GET',
         headers: { 'X-MBX-APIKEY': apiKey },
         timeout: 10000
     });
 
     const accountData = await response.json();
-    if (!response.ok) throw new Error(`Binance API Error: ${JSON.stringify(accountData)}`);
+    if (!response.ok) throw new Error(`Binance API Error: ${JSON.stringify(accountData)} `);
 
     const balances = (accountData.assets || []).filter(b =>
         parseFloat(b.walletBalance) > 0 || parseFloat(b.marginBalance) > 0
@@ -168,9 +225,9 @@ async function executeTradeInternal(supabaseAdmin, userId, trade) {
     // 1.5 Set Leverage (if provided and different)
     const targetLeverage = trade.leverage || 1;
     if (trade.action !== 'CLOSE' && (!existingPos || parseInt(existingPos.leverage) !== targetLeverage)) {
-        console.log(`[Binance API] Setting Leverage for ${cleanSymbol} to ${targetLeverage}x`);
+        console.log(`[Binance API] Setting Leverage for ${cleanSymbol} to ${targetLeverage} x`);
         try {
-            const levQuery = `symbol=${cleanSymbol}&leverage=${targetLeverage}&timestamp=${timestamp}&recvWindow=5000`;
+            const levQuery = `symbol = ${cleanSymbol}& leverage=${targetLeverage}& timestamp=${timestamp}& recvWindow=5000`;
             const levSig = signHmac(secretKey, levQuery);
 
             const levRes = await fetch(`https://testnet.binancefuture.com/fapi/v1/leverage?${levQuery}&signature=${levSig}`, {
@@ -221,7 +278,23 @@ async function executeTradeInternal(supabaseAdmin, userId, trade) {
     // 4. Apply Precision Rounding
     const stepSize = await getSymbolStepSize(cleanSymbol);
     params.quantity = roundToStep(parseFloat(params.quantity.toString()), stepSize);
-    console.log(`[Binance API] Order: ${params.side} ${params.quantity} ${cleanSymbol} (Step: ${stepSize})`);
+
+    // Determine detailed Client Order ID
+    let idPrefix = 'AI_OPEN';
+    if (isClosing) idPrefix = 'AI_CLOSE';
+    params.newClientOrderId = `${idPrefix}_${timestamp}`;
+
+    console.log(`[Binance API] Order: ${params.side} ${params.quantity} ${cleanSymbol} (Step: ${stepSize}) ID: ${params.newClientOrderId}`);
+
+    // VALIDATION: Check quantity, notional value, and balance before executing
+    try {
+        const { balances } = await getUserBinanceContext(supabaseAdmin, userId);
+        const validationResult = await validateTrade(cleanSymbol, params.quantity, params.side, balances);
+        console.log(`[Binance API] Trade validated. Notional: ${validationResult.notionalValue.toFixed(2)} USDT, Price: ${validationResult.marketPrice}`);
+    } catch (validationError) {
+        console.error(`[Binance API] Validation failed for ${cleanSymbol}:`, validationError.message);
+        throw validationError; // Throw to prevent order execution
+    }
 
     const queryString = Object.keys(params).map(key => `${key}=${params[key]}`).join('&');
     const signature = signHmac(secretKey, queryString);
@@ -243,10 +316,11 @@ async function executeTradeInternal(supabaseAdmin, userId, trade) {
         console.log(`[Binance API] Placing SL/TP orders for ${cleanSymbol}...`);
         const tickSize = await getSymbolTickSize(cleanSymbol);
 
-        const placeConditionalOrder = async (type, stopPrice) => {
+        const placeConditionalOrder = async (type, stopPrice, tag) => {
             const exitSide = params.side === 'BUY' ? 'SELL' : 'BUY';
             const roundedPrice = roundToStep(stopPrice, tickSize);
-            const condParams = `symbol=${cleanSymbol}&side=${exitSide}&algoType=CONDITIONAL&type=${type}&triggerPrice=${roundedPrice}&closePosition=true&timestamp=${Date.now()}&recvWindow=5000`;
+            const algoId = `${tag}_${Date.now()}`;
+            const condParams = `symbol=${cleanSymbol}&side=${exitSide}&algoType=CONDITIONAL&type=${type}&triggerPrice=${roundedPrice}&closePosition=true&newClientOrderId=${algoId}&timestamp=${Date.now()}&recvWindow=5000`;
             const condSig = signHmac(secretKey, condParams);
 
             const r = await fetch(`${BINANCE_ALGO_ORDER_URL}?${condParams}&signature=${condSig}`, {
@@ -257,11 +331,11 @@ async function executeTradeInternal(supabaseAdmin, userId, trade) {
         };
 
         if (trade.stopLoss > 0) {
-            const slRes = await placeConditionalOrder('STOP_MARKET', trade.stopLoss);
+            const slRes = await placeConditionalOrder('STOP_MARKET', trade.stopLoss, 'AI_RULE_SL');
             console.log(`[Binance API] SL Result:`, JSON.stringify(slRes));
         }
         if (trade.takeProfit > 0) {
-            const tpRes = await placeConditionalOrder('TAKE_PROFIT_MARKET', trade.takeProfit);
+            const tpRes = await placeConditionalOrder('TAKE_PROFIT_MARKET', trade.takeProfit, 'AI_RULE_TP');
             console.log(`[Binance API] TP Result:`, JSON.stringify(tpRes));
         }
     }
