@@ -160,11 +160,11 @@ async function getUserBinanceContext(supabaseAdmin, userId) {
 
     const timestamp = Date.now();
     const recvWindow = 5000;
-    const queryString = `timestamp = ${timestamp}& recvWindow=${recvWindow} `;
+    const queryString = `timestamp=${timestamp}&recvWindow=${recvWindow}`;
     const signature = signHmac(secretKey, queryString);
 
     const BINANCE_API_URL = 'https://testnet.binancefuture.com/fapi/v2/account';
-    const response = await fetch(`${BINANCE_API_URL}?${queryString}& signature=${signature} `, {
+    const response = await fetch(`${BINANCE_API_URL}?${queryString}&signature=${signature}`, {
         method: 'GET',
         headers: { 'X-MBX-APIKEY': apiKey },
         timeout: 10000
