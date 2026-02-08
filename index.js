@@ -188,6 +188,9 @@ async function runTradeCycle(targetUserId = null, forceRun = false) {
             }
 
             // 6. Notifications
+            console.log(`[Autonomous] [${userId}] actionLog length: ${actionLog.length}`);
+            console.log(`[Autonomous] [${userId}] actionLog:`, actionLog);
+
             if (actionLog.length > 0) {
                 const notificationData = {
                     actions: actionLog,
@@ -195,13 +198,20 @@ async function runTradeCycle(targetUserId = null, forceRun = false) {
                     trade_details: executedTradeDetails
                 };
 
-                await supabaseAdmin.from('notifications').insert({
+                console.log(`[Autonomous] [${userId}] Inserting notification...`);
+                const { data: notifData, error: notifError } = await supabaseAdmin.from('notifications').insert({
                     user_id: userId,
                     type: 'SYSTEM',
                     title: 'Otonom İşlem Raporu',
                     message: actionLog.join(', '),
                     data: notificationData
                 });
+
+                if (notifError) {
+                    console.error(`[Autonomous] [${userId}] Notification insert failed:`, notifError);
+                } else {
+                    console.log(`[Autonomous] [${userId}] Notification inserted successfully`);
+                }
 
                 if (pushToken) {
                     await fetch('https://exp.host/--/api/v2/push/send', {
