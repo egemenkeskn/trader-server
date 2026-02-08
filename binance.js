@@ -1,9 +1,15 @@
 const fetch = require('node-fetch');
 const crypto = require('crypto');
+const CryptoJS = require('crypto-js'); // Added CryptoJS import
 const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
 
 const ENCRYPTION_KEY = process.env.APP_SECRET_KEY;
+
+// Helper to get 32-byte key from any string (SHA-256)
+function getCryptoKey(secret) {
+    return CryptoJS.SHA256(secret).toString(CryptoJS.enc.Hex);
+}
 
 // Decryption Helper
 async function decrypt(text) {
@@ -11,9 +17,13 @@ async function decrypt(text) {
     const iv = Buffer.from(ivHex, 'hex');
     const ciphertext = Buffer.from(cipherHex, 'hex');
 
+    // Derive key using SHA-256 from ENCRYPTION_KEY
+    const derivedKeyHex = getCryptoKey(ENCRYPTION_KEY);
+    const derivedKeyBuffer = Buffer.from(derivedKeyHex, 'hex');
+
     const key = await crypto.webcrypto.subtle.importKey(
         "raw",
-        Buffer.from(ENCRYPTION_KEY, 'hex'),
+        derivedKeyBuffer, // Use the SHA-256 derived key
         "AES-GCM",
         false,
         ["decrypt"]
