@@ -25,6 +25,8 @@ app.get('/', (req, res) => {
 // Reusable function for trade cycle
 async function runTradeCycle(targetUserId = null, forceRun = false) {
     console.log(`[Autonomous] Starting cycle. Target: ${targetUserId || 'ALL'}, Force: ${forceRun}`);
+    console.log(`[Autonomous] Supabase URL: ${SUPABASE_URL}`);
+    console.log(`[Autonomous] Service Key (first 20 chars): ${SUPABASE_SERVICE_ROLE_KEY?.substring(0, 20)}...`);
 
     let query = supabaseAdmin
         .from('user_settings')
@@ -33,13 +35,18 @@ async function runTradeCycle(targetUserId = null, forceRun = false) {
     if (targetUserId) {
         // If specific user is targeted, fetch them regardless of is_autonomous_enabled IF forceRun is true
         // If forceRun is false but targetUserId is set? We still assume we want to check them.
+        console.log(`[Autonomous] Querying for specific user: ${targetUserId}`);
         query = query.eq('user_id', targetUserId);
     } else {
         // Cron Mode: Only fetch enabled users
+        console.log(`[Autonomous] Querying for all users where is_autonomous_enabled = true`);
         query = query.eq('is_autonomous_enabled', true);
     }
 
     const { data: users, error: userError } = await query;
+
+    console.log(`[Autonomous] Query result - Error:`, userError);
+    console.log(`[Autonomous] Query result - Data:`, users);
 
     if (userError) throw userError;
     console.log(`[Autonomous] Found ${users?.length || 0} user(s) to process.`);
