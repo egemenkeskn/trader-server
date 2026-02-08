@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const fetch = require('node-fetch');
+const cron = require('node-cron');
 const { executeTradeInternal, getUserBinanceContext } = require('./binance');
 require('dotenv').config();
 
@@ -18,143 +19,203 @@ const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // Heartbeat Endpoint
 app.get('/', (req, res) => {
-    res.send('Autonomous Trader Server is Live 🚀');
+    res.send('Autonomous Trader Server is Live 🚀 (Scheduler Active)');
 });
 
-// Trigger Endpoint
+// Reusable function for trade cycle
+async function runTradeCycle() {
+    console.log('[Autonomous] Starting background cycle...');
+
+    // 1. Get all users with autonomous mode enabled
+    const { data: users, error: userError } = await supabaseAdmin
+        .from('user_settings')
+        .select('user_id, expo_push_token, autonomous_schedule_type, autonomous_interval, autonomous_daily_time, last_autonomous_run')
+        .eq('is_autonomous_enabled', true);
+
+    if (userError) throw userError;
+    console.log(`[Autonomous] Found ${users?.length || 0} active otonom users.`);
+
+    // TR is always GMT+3 (no DST)
+    const trOffset = 3 * 60 * 60 * 1000
+    const nowUTC = new Date()
+    const nowTR = new Date(nowUTC.getTime() + trOffset)
+
+    const processPromises = users.map(async (user) => {
+        const userId = user.user_id;
+        const pushToken = user.expo_push_token;
+        const scheduleType = user.autonomous_schedule_type || 'interval';
+        const intervalMinutes = user.autonomous_interval || 60;
+        const dailyTime = user.autonomous_daily_time || '09:00';
+        const lastRunRaw = user.last_autonomous_run;
+        const lastRun = lastRunRaw ? new Date(lastRunRaw) : null;
+
+        // 2. Schedule Validation
+        let shouldRun = false;
+
+        if (scheduleType === 'interval') {
+            if (!lastRun) {
+                shouldRun = true;
+            } else {
+                const diffMs = nowUTC.getTime() - lastRun.getTime();
+                const diffMin = Math.floor(diffMs / 60000);
+                if (diffMin >= intervalMinutes) shouldRun = true;
+            }
+        } else if (scheduleType === 'daily') {
+            const [targetHour, targetMin] = dailyTime.split(':').map(Number);
+            const currentHour = nowTR.getUTCHours();
+            const currentMin = nowTR.getUTCMinutes();
+
+            let hasRunToday = false;
+            if (lastRun) {
+                const lastRunTR = new Date(lastRun.getTime() + trOffset);
+                hasRunToday = lastRunTR.getUTCDate() === nowTR.getUTCDate() &&
+                    lastRunTR.getUTCMonth() === nowTR.getUTCMonth() &&
+                    lastRunTR.getUTCFullYear() === nowTR.getUTCFullYear();
+            }
+
+            if (!hasRunToday) {
+                // Check if current time is past the target time (with 5 min window to be safe)
+                if (currentHour > targetHour || (currentHour === targetHour && currentMin >= targetMin)) {
+                    shouldRun = true;
+                }
+            }
+        }
+
+        if (!shouldRun) return;
+
+        console.log(`[Autonomous] >>> STARTING TRADE CYCLE for user ${userId}`);
+
+        // 2.5 Update Last Run Time IMMEDIATELY
+        await supabaseAdmin
+            .from('user_settings')
+            .update({ last_autonomous_run: nowUTC.toISOString() })
+            .eq('user_id', userId);
+
+        // Fetch context
+        console.log(`[Autonomous] Fetching Binance context for ${userId}...`);
+        const { balances, positions } = await getUserBinanceContext(supabaseAdmin, userId);
+
+        // 3. Invoke Analyst
+        console.log(`[Autonomous] Calling analyst at: ${ANALYST_SERVER_URL}`);
+
+        const analystResponse = await fetch(ANALYST_SERVER_URL, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+                'apikey': SUPABASE_SERVICE_ROLE_KEY,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                userQuery: "Mevcut pozisyonlarımı değerlendir ve kâr gördüğün en iyi 3 yeni fırsatı uygulayarak portföyümü optimize et.",
+                userBalances: balances,
+                userPositions: positions,
+                userId: userId
+            })
+        });
+
+        if (!analystResponse.ok) {
+            const errorBody = await analystResponse.text();
+            throw new Error(`Analyst failed for ${userId}: ${errorBody}`);
+        }
+
+        const analysis = await analystResponse.json();
+        console.log(`[Autonomous] Analyst recommendation count:`, analysis.tradeRecommendations?.length || 0);
+
+        let actionLog = [];
+        let executedTradeDetails = [];
+
+        // 4. Execute Trades
+        for (const trade of analysis.tradeRecommendations || []) {
+            console.log(`[Autonomous] [${userId}] Attempting: ${trade.action} ${trade.symbol}`);
+
+            try {
+                const tradeResult = await executeTradeInternal(supabaseAdmin, userId, trade);
+                if (tradeResult.orderId) {
+                    console.log(`[Autonomous] [${userId}] SUCCESS: ${trade.symbol} OrderId: ${tradeResult.orderId}`);
+                    actionLog.push(`${trade.symbol} ${tradeResult.isClosing ? 'kapatıldı' : 'alındı'}`);
+
+                    await supabaseAdmin.from('autonomous_trades').insert({
+                        order_id: tradeResult.orderId,
+                        user_id: userId,
+                        symbol: trade.symbol
+                    });
+
+                    executedTradeDetails.push({
+                        symbol: trade.symbol,
+                        reason: trade.reason,
+                        action: tradeResult.isClosing ? 'CLOSE' : trade.action,
+                        orderId: tradeResult.orderId,
+                        leverage: trade.leverage,
+                        stopLoss: trade.stopLoss,
+                        takeProfit: trade.takeProfit,
+                        quantity: trade.quantity
+                    });
+                }
+            } catch (tErr) {
+                console.error(`[Autonomous] [${userId}] Error executing ${trade.symbol}:`, tErr.message || tErr);
+            }
+        }
+
+        // 6. Notifications
+        if (actionLog.length > 0) {
+            const notificationData = {
+                actions: actionLog,
+                ai_narrative: analysis.text,
+                trade_details: executedTradeDetails
+            };
+
+            await supabaseAdmin.from('notifications').insert({
+                user_id: userId,
+                type: 'SYSTEM',
+                title: 'Otonom İşlem Raporu',
+                message: actionLog.join(', '),
+                data: notificationData
+            });
+
+            if (pushToken) {
+                await fetch('https://exp.host/--/api/v2/push/send', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        to: pushToken,
+                        title: "Otonom İşlem Raporu",
+                        body: actionLog.join('\n'),
+                        sound: 'default',
+                        badge: 1
+                    })
+                });
+            }
+        } else {
+            console.log(`[Autonomous] No trade actions took place for user ${userId}`);
+        }
+    });
+
+    return Promise.allSettled(processPromises);
+}
+
+// Internal Cron Job (Runs every minute)
+cron.schedule('* * * * *', () => {
+    console.log('⏰ [Cron] Running every-minute check...');
+    runTradeCycle().then(() => {
+        console.log('✅ [Cron] Minute check complete.');
+    }).catch(err => {
+        console.error('❌ [Cron] Error in minute check:', err);
+    });
+});
+
+// Trigger Endpoint (Manual Override)
 app.post('/trigger', async (req, res) => {
     try {
         console.log('🔔 [HEARTBEAT] Otonom Trader Triggered manually!');
 
-        console.log('[Autonomous] Starting background cycle...');
-
-        // 1. Get all users with autonomous mode enabled
-        const { data: users, error: userError } = await supabaseAdmin
-            .from('user_settings')
-            .select('user_id, expo_push_token, autonomous_schedule_type, autonomous_interval, autonomous_daily_time, last_autonomous_run')
-            .eq('is_autonomous_enabled', true);
-
-        if (userError) throw userError;
-        console.log(`[Autonomous] Found ${users?.length || 0} active otonom users.`);
-
-        const processPromises = users.map(async (user) => {
-            const userId = user.user_id;
-            const pushToken = user.expo_push_token;
-            // Schedule validation logic omitted for manual trigger - assuming trigger means RUN
-            // But we should update last_autonomous_run to prevent double runs if we keep cron
-
-            console.log(`[Autonomous] >>> STARTING TRADE CYCLE for user ${userId}`);
-
-            // 2.5 Update Last Run Time
-            await supabaseAdmin
-                .from('user_settings')
-                .update({ last_autonomous_run: new Date().toISOString() })
-                .eq('user_id', userId);
-
-            // Fetch context
-            console.log(`[Autonomous] Fetching Binance context for ${userId}...`);
-            const { balances, positions } = await getUserBinanceContext(supabaseAdmin, userId);
-
-            // 3. Invoke Analyst
-            console.log(`[Autonomous] Calling analyst at: ${ANALYST_SERVER_URL}`);
-
-            // NO TIMEOUT LIMIT HERE (Node.js default is very long, or we can set it custom)
-            const analystResponse = await fetch(ANALYST_SERVER_URL, {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-                    'apikey': SUPABASE_SERVICE_ROLE_KEY,
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    userQuery: "Mevcut pozisyonlarımı değerlendir ve kâr gördüğün en iyi 3 yeni fırsatı uygulayarak portföyümü optimize et.",
-                    userBalances: balances,
-                    userPositions: positions,
-                    userId: userId
-                })
-            });
-
-            if (!analystResponse.ok) {
-                const errorBody = await analystResponse.text();
-                throw new Error(`Analyst failed for ${userId}: ${errorBody}`);
-            }
-
-            const analysis = await analystResponse.json();
-            console.log(`[Autonomous] Analyst recommendation count:`, analysis.tradeRecommendations?.length || 0);
-
-            let actionLog = [];
-            let executedTradeDetails = [];
-
-            // 4. Execute Trades
-            for (const trade of analysis.tradeRecommendations || []) {
-                console.log(`[Autonomous] [${userId}] Attempting: ${trade.action} ${trade.symbol}`);
-
-                try {
-                    const tradeResult = await executeTradeInternal(supabaseAdmin, userId, trade);
-                    if (tradeResult.orderId) {
-                        console.log(`[Autonomous] [${userId}] SUCCESS: ${trade.symbol} OrderId: ${tradeResult.orderId}`);
-                        actionLog.push(`${trade.symbol} ${tradeResult.isClosing ? 'kapatıldı' : 'alındı'}`);
-
-                        await supabaseAdmin.from('autonomous_trades').insert({
-                            order_id: tradeResult.orderId,
-                            user_id: userId,
-                            symbol: trade.symbol
-                        });
-
-                        executedTradeDetails.push({
-                            symbol: trade.symbol,
-                            reason: trade.reason,
-                            action: tradeResult.isClosing ? 'CLOSE' : trade.action,
-                            orderId: tradeResult.orderId,
-                            leverage: trade.leverage,
-                            stopLoss: trade.stopLoss,
-                            takeProfit: trade.takeProfit,
-                            quantity: trade.quantity
-                        });
-                    }
-                } catch (tErr) {
-                    console.error(`[Autonomous] [${userId}] Error executing ${trade.symbol}:`, tErr.message || tErr);
-                }
-            }
-
-            // 6. Notifications
-            if (actionLog.length > 0) {
-                const notificationData = {
-                    actions: actionLog,
-                    ai_narrative: analysis.text,
-                    trade_details: executedTradeDetails
-                };
-
-                await supabaseAdmin.from('notifications').insert({
-                    user_id: userId,
-                    type: 'SYSTEM',
-                    title: 'Otonom İşlem Raporu',
-                    message: actionLog.join(', '),
-                    data: notificationData
-                });
-
-                if (pushToken) {
-                    await fetch('https://exp.host/--/api/v2/push/send', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            to: pushToken,
-                            title: "Otonom İşlem Raporu",
-                            body: actionLog.join('\n'),
-                            sound: 'default',
-                            badge: 1
-                        })
-                    });
-                }
-            } else {
-                console.log(`[Autonomous] No trade actions took place for user ${userId}`);
-            }
+        // Run in background - Do NOT await
+        runTradeCycle().then(() => {
+            console.log('✅ [Autonomous] Cycle finished successfully.');
+        }).catch(err => {
+            console.error('❌ [Autonomous] Cycle finished with errors:', err);
         });
 
-        // Wait for all users to be processed
-        await Promise.allSettled(processPromises);
-
-        res.json({ success: true, message: 'Cycle completed' });
+        res.json({ success: true, message: 'Cycle started in background 🚀' });
 
     } catch (error) {
         console.error('[Error]', error);
