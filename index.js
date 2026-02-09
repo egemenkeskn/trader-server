@@ -126,6 +126,34 @@ async function runTradeCycle(targetUserId = null, forceRun = false) {
         try {
             const { balances, positions } = await getUserBinanceContext(supabaseAdmin, userId);
 
+            // 2.7 Fetch Autonomous Trade History for Position Enrichment
+            console.log(`[Autonomous] Fetching position history for context...`);
+            const { data: autonomousHistory } = await supabaseAdmin
+                .from('autonomous_trades')
+                .select('symbol, open_reason, confidence_score, created_at')
+                .eq('user_id', userId)
+                .order('created_at', { ascending: false });
+
+            // Enrich positions with opening context
+            const enrichedPositions = positions.map(pos => {
+                const history = autonomousHistory?.find(h => h.symbol === pos.symbol);
+                if (history) {
+                    const openedAt = new Date(history.created_at);
+                    const ageMs = Date.now() - openedAt.getTime();
+                    const ageHours = (ageMs / (1000 * 60 * 60)).toFixed(1);
+                    return {
+                        ...pos,
+                        openedAt: history.created_at,
+                        openingReason: history.open_reason || 'No reason recorded',
+                        openingConfidence: history.confidence_score || 0.9,
+                        ageHours: parseFloat(ageHours)
+                    };
+                }
+                return pos; // Position not in autonomous history (manual trade)
+            });
+
+            console.log(`[Autonomous] Enriched ${enrichedPositions.filter(p => p.ageHours).length}/${positions.length} positions with history`);
+
             // 3. Invoke Analyst
             console.log(`[Autonomous] Calling analyst at: ${ANALYST_SERVER_URL}`);
 
@@ -137,7 +165,7 @@ async function runTradeCycle(targetUserId = null, forceRun = false) {
                 body: JSON.stringify({
                     userQuery: "Mevcut pozisyonlarımı değerlendir ve kâr gördüğün en iyi 3 yeni fırsatı uygulayarak portföyümü optimize et.",
                     userBalances: balances,
-                    userPositions: positions,
+                    userPositions: enrichedPositions,  // ✅ Now includes opening context
                     userId: userId
                 })
             });
@@ -166,7 +194,9 @@ async function runTradeCycle(targetUserId = null, forceRun = false) {
                         await supabaseAdmin.from('autonomous_trades').insert({
                             order_id: tradeResult.orderId,
                             user_id: userId,
-                            symbol: trade.symbol
+                            symbol: trade.symbol,
+                            open_reason: trade.reason || 'Autonomous analysis',
+                            confidence_score: trade.confidence || 0.9
                         });
 
                         executedTradeDetails.push({
