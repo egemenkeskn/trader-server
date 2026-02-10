@@ -227,7 +227,7 @@ async function executeTradeInternal(supabaseAdmin, userId, trade) {
     if (trade.action !== 'CLOSE' && (!existingPos || parseInt(existingPos.leverage) !== targetLeverage)) {
         console.log(`[Binance API] Setting Leverage for ${cleanSymbol} to ${targetLeverage} x`);
         try {
-            const levQuery = `symbol = ${cleanSymbol}& leverage=${targetLeverage}& timestamp=${timestamp}& recvWindow=5000`;
+            const levQuery = `symbol=${cleanSymbol}&leverage=${targetLeverage}&timestamp=${timestamp}&recvWindow=5000`;
             const levSig = signHmac(secretKey, levQuery);
 
             const levRes = await fetch(`https://testnet.binancefuture.com/fapi/v1/leverage?${levQuery}&signature=${levSig}`, {
