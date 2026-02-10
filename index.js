@@ -22,6 +22,16 @@ app.get('/', (req, res) => {
     res.send('Autonomous Trader Server is Live 🚀 (Scheduler Active)');
 });
 
+// Keepalive Endpoint (for UptimeRobot/cron-job.org to prevent sleep)
+app.get('/keepalive', (req, res) => {
+    console.log('⏰ [Keepalive] Ping received, server staying awake');
+    res.json({
+        status: 'alive',
+        uptime: process.uptime(),
+        timestamp: new Date().toISOString()
+    });
+});
+
 // Reusable function for trade cycle
 async function runTradeCycle(targetUserId = null, forceRun = false) {
     console.log(`[Autonomous] Starting cycle. Target: ${targetUserId || 'ALL'}, Force: ${forceRun}`);
