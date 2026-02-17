@@ -199,7 +199,19 @@ async function runTradeCycle(targetUserId = null, forceRun = false) {
                     const tradeResult = await executeTradeInternal(supabaseAdmin, userId, trade);
                     if (tradeResult.orderId) {
                         console.log(`[Autonomous] [${userId}] SUCCESS: ${trade.symbol} OrderId: ${tradeResult.orderId}`);
-                        actionLog.push(`${trade.symbol} ${tradeResult.isClosing ? 'kapatıldı' : 'alındı'}`);
+                        // Determine correct action label
+                        let actionLabel;
+                        if (tradeResult.isClosing) {
+                            actionLabel = 'kapatıldı';
+                        } else if (trade.action === 'BUY' || trade.action === 'AL') {
+                            actionLabel = 'alındı (LONG)';
+                        } else if (trade.action === 'SELL' || trade.action === 'SAT') {
+                            actionLabel = 'satıldı (SHORT)';
+                        } else {
+                            actionLabel = 'işlem yapıldı';
+                        }
+
+                        actionLog.push(`${trade.symbol} ${actionLabel}`);
 
                         await supabaseAdmin.from('autonomous_trades').insert({
                             order_id: tradeResult.orderId,
